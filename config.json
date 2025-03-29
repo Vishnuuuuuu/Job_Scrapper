@@ -5,6 +5,7 @@
     "telegram_chat_id": "1795700172",
     "target_url": "https://www.freejobalert.com/latest-notifications/",
     "category": "Diploma",
+    "lookback_hours": 24,
     "today_only": true,
     "date_format": "%d-%m-%Y",
     "notify_when_no_jobs": true

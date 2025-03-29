@@ -1,2 +1,16 @@
 .qodo
+# Ignore configuration files with sensitive data
 config.json
+*.env
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore virtual environment
+venv/
+env/
+
+# Ignore log files
+*.log

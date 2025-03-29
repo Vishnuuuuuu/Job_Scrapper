@@ -31,6 +31,16 @@ class JobScraperBot:
             "Diploma", "BCA", "MCA", "B.Tech", "M.Tech", 
             "B.Sc", "M.Sc", "BA", "MA", "All"
         ]
+        
+    async def _delete_message(self, context: ContextTypes.DEFAULT_TYPE):
+        """Delete a message after the specified time."""
+        chat_id = context.job.data["chat_id"]
+        message_id = context.job.data["message_id"]
+        
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            logger.error(f"Error deleting message: {e}")
 
     def load_config(self, config_path):
         """Load configuration from JSON file or environment variables"""
@@ -81,7 +91,7 @@ class JobScraperBot:
             # Find all job rows
             job_rows = soup.find_all('tr', class_='lattrbord latoclr')
             
-            # Calculate the cutoff time (24 hours ago by default)
+            # Calculate the cutoff time (24 hours ago)
             lookback_hours = self.config.get('lookback_hours', 24)
             cutoff_time = datetime.now() - timedelta(hours=lookback_hours)
             
@@ -130,19 +140,44 @@ class JobScraperBot:
 
     def _is_recent(self, date_str: str, cutoff_time: datetime) -> bool:
         """
-        Check if the given date string is more recent than the cutoff time
+        Check if the given date string is from within the last 24 hours
         
         :param date_str: Date string from job posting
-        :param cutoff_time: Datetime object representing the cutoff time
-        :return: Boolean indicating if the date is recent
+        :param cutoff_time: Datetime object representing the cutoff time (24 hours ago)
+        :return: Boolean indicating if the date is from the last 24 hours
         """
         try:
-            # Adjust the parsing based on the actual date format on the website
-            job_date = datetime.strptime(date_str.strip(), self.config.get('date_format', '%d-%m-%Y'))
-            return job_date >= cutoff_time
+            # Handle multiple date formats
+            date_formats = ['%d/%m/%Y', '%d-%m-%Y', '%Y-%m-%d', '%d.%m.%Y']
+            
+            # Try each format until one works
+            for date_format in date_formats:
+                try:
+                    job_date = datetime.strptime(date_str.strip(), date_format)
+                    
+                    # Compare with cutoff time (24 hours ago)
+                    current_time = datetime.now()
+                    yesterday = current_time - timedelta(hours=24)
+                    
+                    # For debugging
+                    logger.info(f"Job date: {job_date}, Current time: {current_time}, Yesterday: {yesterday}")
+                    
+                    # Check if job date is within the last 24 hours
+                    # Compare only the date part if the website only shows dates without time
+                    if job_date.date() == current_time.date() or job_date.date() == yesterday.date():
+                        return True
+                    
+                    return False
+                except ValueError:
+                    continue
+            
+            # If none of the formats worked
+            logger.error(f"Could not parse date: {date_str} with any known format")
+            return True  # Include job if date parsing fails
+            
         except Exception as e:
-            logger.error(f"Error parsing date: {e}")
-            # If there's an error parsing the date, include the job to be safe
+            logger.error(f"Error in date comparison: {e}")
+            # If there's an error in the comparison, include the job to be safe
             return True
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -150,19 +185,13 @@ class JobScraperBot:
         user = update.effective_user
         welcome_text = (
             f"Hello {user.first_name}! 👋\n\n"
-            f"I'm your Job Alert Bot. I can help you find the latest job postings "
+            f"I'm your Job Alert Bot. I can help you find job postings from the last 24 hours "
             f"based on your qualification.\n\n"
-            f"Use the menu below to select your qualification category:"
+            f"Use the button below to see qualification categories:"
         )
         
-        # Create category selection keyboard
-        keyboard = []
-        row = []
-        for i, category in enumerate(self.categories):
-            row.append(InlineKeyboardButton(category, callback_data=f"category_{category}"))
-            if (i + 1) % 3 == 0 or i == len(self.categories) - 1:
-                keyboard.append(row)
-                row = []
+        # Create a single button to show categories
+        keyboard = [[InlineKeyboardButton("Show Categories", callback_data="show_categories")]]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(welcome_text, reply_markup=reply_markup)
@@ -181,9 +210,20 @@ class JobScraperBot:
             "2. Select your qualification from the menu\n"
             "3. The bot will show you jobs posted in the last 24 hours\n"
             "4. Use /categories anytime to change your selection\n"
-            "5. Use /getjobs to quickly check for new jobs with your saved preference"
+            "5. Use /getjobs to quickly check for new jobs with your saved preference\n\n"
+            "Note: All messages will be automatically deleted after 30 minutes."
         )
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        
+        # Send help message and schedule deletion
+        help_message = await update.message.reply_text(help_text, parse_mode='Markdown')
+        
+        # Schedule message deletion (30 minutes = 1800 seconds)
+        if hasattr(context, 'job_queue') and context.job_queue is not None:
+            context.job_queue.run_once(
+                self._delete_message, 
+                1800, 
+                data={"chat_id": help_message.chat_id, "message_id": help_message.message_id}
+            )
 
     async def categories_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show available categories when /categories command is issued."""
@@ -199,7 +239,15 @@ class JobScraperBot:
                 row = []
         
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(categories_text, reply_markup=reply_markup)
+        message = await update.message.reply_text(categories_text, reply_markup=reply_markup)
+        
+        # Schedule message deletion (30 minutes = 1800 seconds)
+        if hasattr(context, 'job_queue') and context.job_queue is not None:
+            context.job_queue.run_once(
+                self._delete_message, 
+                1800, 
+                data={"chat_id": message.chat_id, "message_id": message.message_id}
+            )
 
     async def getjobs_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Get jobs with saved preference when /getjobs command is issued."""
@@ -207,14 +255,22 @@ class JobScraperBot:
         
         if user_id in self.user_preferences:
             category = self.user_preferences[user_id]
-            await update.message.reply_text(f"Searching for {category} jobs posted in the last 24 hours...")
+            message = await update.message.reply_text(f"Searching for {category} jobs posted in the last 24 hours...")
+            
+            # Schedule message deletion (30 minutes = 1800 seconds)
+            if hasattr(context, 'job_queue') and context.job_queue is not None:
+                context.job_queue.run_once(
+                    self._delete_message, 
+                    1800, 
+                    data={"chat_id": message.chat_id, "message_id": message.message_id}
+                )
             
             # Scrape jobs for the saved category
             jobs = await self.scrape_jobs(category)
             await self._send_job_results(update, context, category, jobs)
         else:
             # No saved preference, show categories
-            await update.message.reply_text(
+            message = await update.message.reply_text(
                 "You don't have a saved preference yet. Please select a category:",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(category, callback_data=f"category_{category}") 
@@ -225,14 +281,38 @@ class JobScraperBot:
                      for category in self.categories[6:]]
                 ])
             )
+            
+            # Schedule message deletion (30 minutes = 1800 seconds)
+            if hasattr(context, 'job_queue') and context.job_queue is not None:
+                context.job_queue.run_once(
+                    self._delete_message, 
+                    1800, 
+                    data={"chat_id": message.chat_id, "message_id": message.message_id}
+                )
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle button presses."""
         query = update.callback_query
         await query.answer()
         
+        # Show categories when the "Show Categories" button is pressed
+        if query.data == "show_categories":
+            categories_text = "Please select your qualification category:"
+            
+            # Create category selection keyboard
+            keyboard = []
+            row = []
+            for i, category in enumerate(self.categories):
+                row.append(InlineKeyboardButton(category, callback_data=f"category_{category}"))
+                if (i + 1) % 3 == 0 or i == len(self.categories) - 1:
+                    keyboard.append(row)
+                    row = []
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(text=categories_text, reply_markup=reply_markup)
+        
         # Get the category from callback data
-        if query.data.startswith("category_"):
+        elif query.data.startswith("category_"):
             category = query.data.replace("category_", "")
             
             # Save user preference
@@ -251,6 +331,9 @@ class JobScraperBot:
 
     async def _send_job_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE, category: str, jobs: List[Dict]) -> None:
         """Send job results to the user."""
+        # Set message auto-delete time (30 minutes = 1800 seconds)
+        auto_delete_time = 1800
+        
         if not jobs:
             try:
                 await update.callback_query.edit_message_text(
@@ -261,14 +344,24 @@ class JobScraperBot:
                 )
             except AttributeError:
                 # If this was called from a command, not a callback
-                await context.bot.send_message(
+                message = await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text=f"No {category} jobs found in the last 24 hours. Try another category.",
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("Search Again", callback_data="search_again")
                     ]])
                 )
+                # Schedule message deletion if job_queue is available
+                if hasattr(context, 'job_queue') and context.job_queue is not None:
+                    context.job_queue.run_once(
+                        self._delete_message, 
+                        auto_delete_time, 
+                        data={"chat_id": message.chat_id, "message_id": message.message_id}
+                    )
         else:
+            # List to store message IDs for later deletion
+            messages_to_delete = []
+            
             try:
                 # Edit the original message
                 await update.callback_query.edit_message_text(
@@ -276,10 +369,17 @@ class JobScraperBot:
                 )
             except AttributeError:
                 # If this was called from a command, not a callback
-                await context.bot.send_message(
+                message = await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text=f"Found {len(jobs)} {category} jobs in the last 24 hours. Sending details..."
                 )
+                # Schedule message deletion if job_queue is available
+                if hasattr(context, 'job_queue') and context.job_queue is not None:
+                    context.job_queue.run_once(
+                        self._delete_message, 
+                        auto_delete_time, 
+                        data={"chat_id": message.chat_id, "message_id": message.message_id}
+                    )
             
             # Send each job as a separate message
             for job in jobs:
@@ -296,20 +396,36 @@ class JobScraperBot:
                 if job['link']:
                     message += f"*Apply Here:* {job['link']}"
                 
-                await context.bot.send_message(
+                job_message = await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text=message,
                     parse_mode='Markdown'
                 )
+                
+                # Schedule message deletion if job_queue is available
+                if hasattr(context, 'job_queue') and context.job_queue is not None:
+                    context.job_queue.run_once(
+                        self._delete_message, 
+                        auto_delete_time, 
+                        data={"chat_id": job_message.chat_id, "message_id": job_message.message_id}
+                    )
             
             # Send a button to search again
-            await context.bot.send_message(
+            final_message = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text="Would you like to search for jobs in another category?",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("Search Again", callback_data="search_again")
                 ]])
             )
+            
+            # Schedule final message deletion if job_queue is available
+            if hasattr(context, 'job_queue') and context.job_queue is not None:
+                context.job_queue.run_once(
+                    self._delete_message, 
+                    auto_delete_time, 
+                    data={"chat_id": final_message.chat_id, "message_id": final_message.message_id}
+                )
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle errors."""
